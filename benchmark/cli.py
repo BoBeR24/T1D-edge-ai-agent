@@ -205,6 +205,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "context window and give the agent only log_conclusion. For with-tools vs "
         "without-tools comparisons. (Tool/argument scoring dimensions are dropped.)",
     )
+    parser.add_argument(
+        "--skills",
+        choices=["none", "oracle"],
+        default="none",
+        help="Skill mode. 'oracle': for categories mapped in benchmark/skill_loader.py, "
+        "append the matching SKILL.md to the system prompt and expose only that "
+        "skill's tools (+ log_conclusion). 'none' (default) = baseline.",
+    )
     return parser
 
 
@@ -377,6 +385,7 @@ def main() -> int:
                     no_tools=args.no_tools,
                     agent_timeout=args.agent_timeout,
                     agent_max_tokens=args.agent_max_tokens,
+                    skills_mode=args.skills,
                 )
                 scores = evaluate_all(
                     traces=traces,

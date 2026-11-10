@@ -290,6 +290,84 @@ clarity, and clinical caution:
 ```bash
 python -m benchmark --model qwen3:8b --judge-model gpt-4.1 --judge-provider zen
 ```
+### Skills (oracle mode)
+
+A *skill* is a short, step-by-step procedure for one type of task, stored in a
+`SKILL.md` file. In **oracle mode** the benchmark picks the skill from the task's
+`category`, appends its instructions to the system prompt, and shows the model only
+the tools the skill declares (plus `log_conclusion`). Tasks whose category has no
+skill run exactly as the baseline. It is called "oracle" because the category is
+known in the benchmark but not in real use: results are the upper bound for any
+automatic skill-selection mechanism.
+
+```bash
+python -m benchmark --model qwen3:8b --skills oracle                     # skills on
+python -m benchmark --model qwen3:8b --skills none                       # baseline (default)
+```
+
+Before each task that uses a skill the log prints
+`[benchmark] Oracle skill '<name>' for <task_id>`, and the trace records `"skill"`.
+
+#### Adding one or more skills
+
+For each new skill:
+
+1. **Create the skill file** `benchmark/skills/<skill-name>/SKILL.md`:
+
+   ```markdown
+   ---
+   name: <skill-name>
+   description: One line saying when the skill applies.
+   tools: [tool_a, tool_b]
+   ---
+   Goal: ...
+
+   Steps:
+   1. ...
+   ```
+
+   - `name` must match the folder name.
+   - `tools` lists the only data tools the model will see. Do not list
+     `log_conclusion`: it is always added.
+   - The body (below the header) is what the model reads.
+
+2. **Map the category** in `benchmark/skill_loader.py`, one line per category:
+
+   ```python
+   ORACLE_SKILL_FOR_CATEGORY: dict[str, str] = {
+       "pattern_analysis": "dawn-phenomenon",
+       "<category>": "<skill-name>",
+   }
+   ```
+
+   Categories are the `category` values in `benchmark/tasks_v2.json`. Each category
+   maps to one skill; several categories may share the same skill.
+
+3. **Check the tools exist.** Every name in `tools` must be a tool returned by
+   `_build_benchmark_tools` in `benchmark/runner.py`; otherwise the run stops with
+   `Skill '<name>' declares unknown tools`. If the skill needs a new tool, add it
+   there first and, if the tasks should accept it, add it to their
+   `expected_tools` / `acceptable_tools` in `benchmark/tasks_v2.json`.
+
+4. **Check the skill loads:**
+
+   ```bash
+   python -c "from benchmark.skill_loader import load_oracle_skill as f; s=f('<category>'); print(s['name'], s['tools'])"
+   ```
+
+5. **Measure it** on the category's tasks, with and without the skill, same model
+   and settings:
+
+   ```bash
+   python -m benchmark --model <model> --skills oracle --task-ids <ids> --output benchmark_results_<skill>_oracle
+   python -m benchmark --model <model> --skills none   --task-ids <ids> --output benchmark_results_<skill>_none
+   ```
+
+When writing a skill: keep it short and procedural; name the exact tool, arguments
+and ISO date format; prefer tools that return computed results over raw data;
+require both a `log_conclusion` call with the task's keys and a non-empty reply to
+the user; and **use only made-up dates and values in examples**: real benchmark
+values would leak the ground truth.
 
 ### Common invocations
 
@@ -309,7 +387,8 @@ python -m benchmark --model qwen3:8b \
 python -m benchmark --model qwen3:8b --no-tools --agent-timeout 900
 ```
 
-Other flags: `--output`, `--tasks-path`, `--agent-max-tokens`, `--keep-db`.
+Other flags: `--output`, `--tasks-path`, `--agent-max-tokens`, `--keep-db`,
+`--skills {none,oracle}`.
 Full list via `python -m benchmark --help`.
 
 > `--no-tools` prefills the model's context with the patient's entire dataset
@@ -405,6 +484,8 @@ tools query.
 │   ├── evaluator.py          Deterministic scoring + LLM judge
 │   ├── isolation.py          Per-run isolated DB/KB/session state
 │   ├── user_simulator.py     Simulated user for multi-turn tasks
+│   ├── skill_loader.py       Category -> skill mapping, SKILL.md parser
+│   ├── skills/               One folder per skill, each with a SKILL.md
 │   └── tasks_v2.json         The 72-task suite
 ├── analysis/               Scoring analysis and figure generation
 ├── scripts/                Multi-model sweep scripts

@@ -42,3 +42,11 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# --- Our benchmark runs (contain OhioT1DM readings: do not publish) --------
+benchmark_results_baseline*/
+benchmark_results_smoke/
+benchmark_results_oracle*/
+
+# --- Backups created by patch scripts ---------------------------------------
+*.bak

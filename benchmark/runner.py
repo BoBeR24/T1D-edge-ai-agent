@@ -24,6 +24,7 @@ from agent.tools import (
     search_logged_events,
 )
 from benchmark.spoonacular_cache import CACHED_SPOONACULAR_TOOLS
+from benchmark.skill_loader import load_oracle_skill
 from benchmark.user_simulator import (
     ContinueAction,
     EvaluatorSimulator,
@@ -683,7 +684,10 @@ def _build_benchmark_tools(db_path: str, no_tools: bool = False) -> list[Any]:
 
 
 def _agent_node(
-    state: MessagesState, llm_with_tools: Any, data_context: str | None = None
+    state: MessagesState,
+    llm_with_tools: Any,
+    data_context: str | None = None,
+    skill_text: str | None = None,
 ):
     messages = state["messages"]
     if not any(getattr(m, "type", None) == "system" for m in messages):
@@ -692,6 +696,9 @@ def _agent_node(
         # model has everything it needs to answer without querying tools.
         if data_context:
             system_text = f"{system_text}\n\n{data_context}"
+        # Oracle skill: append the skill instructions to the system prompt.
+        if skill_text:
+            system_text = f"{system_text}\n\n{skill_text}"
         messages = [SystemMessage(content=system_text)] + messages
 
     response = llm_with_tools.invoke(messages)
@@ -724,8 +731,19 @@ def build_benchmark_graph(
     no_tools: bool = False,
     agent_timeout: int | None = None,
     agent_max_tokens: int | None = None,
+    skill: dict[str, Any] | None = None,
 ):
     tools = _build_benchmark_tools(db_path, no_tools=no_tools)
+    # Oracle skill: expose only the tools declared by the skill (+ log_conclusion).
+    if skill is not None:
+        allowed = set(skill["tools"]) | {"log_conclusion"}
+        available = {t.name for t in tools}
+        unknown = set(skill["tools"]) - available
+        if unknown:
+            raise ValueError(
+                f"Skill '{skill['name']}' declares unknown tools: {sorted(unknown)}"
+            )
+        tools = [t for t in tools if t.name in allowed]
     # No-tools mode injects the full dataset, so prefill is large and slow. Give the
     # agent a generous timeout and disable retries — a retry just re-sends the whole
     # prompt and restarts prompt processing from scratch (the "restart" loop). The
@@ -744,7 +762,12 @@ def build_benchmark_graph(
     data_context = serialize_patient_data(db_path) if no_tools else None
 
     def agent_node(state: MessagesState):
-        return _agent_node(state, llm_with_tools, data_context=data_context)
+        return _agent_node(
+            state,
+            llm_with_tools,
+            data_context=data_context,
+            skill_text=skill["body"] if skill else None,
+        )
 
     builder = StateGraph(MessagesState)
     builder.add_node("agent", agent_node)
@@ -774,6 +797,31 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _usage_of(message: Any) -> dict[str, int]:
+    """Token counts reported by the endpoint for one model call (0 if missing)."""
+    usage = getattr(message, "usage_metadata", None) or {}
+    details = usage.get("output_token_details") or {}
+    return {
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "reasoning_tokens": int(details.get("reasoning") or 0),
+    }
+
+
+def _token_stats(ai_messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-call token usage for one task."""
+    calls = [m["usage"] for m in ai_messages if m.get("type") == "ai" and "usage" in m]
+    inputs = [u["input_tokens"] for u in calls]
+    return {
+        "llm_calls": len(calls),
+        "input_tokens_total": sum(inputs),
+        "output_tokens_total": sum(u["output_tokens"] for u in calls),
+        "reasoning_tokens_total": sum(u["reasoning_tokens"] for u in calls),
+        "first_call_input_tokens": inputs[0] if inputs else 0,
+        "max_input_tokens": max(inputs) if inputs else 0,
+    }
+
+
 def _capture_messages(
     messages: list[Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str], str]:
@@ -800,6 +848,7 @@ def _capture_messages(
                 {
                     "type": "ai",
                     "content": text,
+                    "usage": _usage_of(message),
                     "tool_calls": [
                         {
                             "id": str(c.get("id", "")),
@@ -862,6 +911,7 @@ def run_single_task(
         "final_response": final_response,
         "turn_count": len([m for m in ai_messages if m["type"] == "ai"]),
         "tool_call_count": len(tool_calls),
+        **_token_stats(ai_messages),
     }
 
 
@@ -1093,6 +1143,7 @@ def run_multi_turn_task(
         "final_response": turns[-1]["final_response"] if turns else "",
         "turn_count": len(turns),
         "tool_call_count": len(all_tool_calls),
+        **_token_stats(flat_messages),
         **(
             {"evaluator_rejection": evaluator_rejection}
             if evaluator_rejection is not None
@@ -1175,7 +1226,9 @@ def run_benchmark(
     no_tools: bool = False,
     agent_timeout: int | None = None,
     agent_max_tokens: int | None = None,
+    skills_mode: str = "none",
 ) -> list[dict[str, Any]]:
+    # Baseline agent: all tools, no skill.
     graph = build_benchmark_graph(
         db_path=db_path,
         model_name=model_name,
@@ -1185,14 +1238,36 @@ def run_benchmark(
         agent_max_tokens=agent_max_tokens,
     )
     traces: list[dict[str, Any]] = []
+    # One agent per skill: built the first time the skill is needed, then reused.
+    skill_graphs: dict[str, Any] = {}
     for task in tasks:
+        # Default: run the task with the baseline agent.
+        task_graph, skill = graph, None
+        # Oracle mode: pick the skill from the task category, if one is mapped.
+        if skills_mode == "oracle" and not no_tools:
+            skill = load_oracle_skill(task.get("category", ""))
+            if skill is not None:
+                if skill["name"] not in skill_graphs:
+                    skill_graphs[skill["name"]] = build_benchmark_graph(
+                        db_path=db_path,
+                        model_name=model_name,
+                        provider=provider,
+                        no_tools=no_tools,
+                        agent_timeout=agent_timeout,
+                        agent_max_tokens=agent_max_tokens,
+                        skill=skill,
+                    )
+                task_graph = skill_graphs[skill["name"]]
+                print(
+                    f"[benchmark] Oracle skill '{skill['name']}' for {task['task_id']}"
+                )
         print(
             f"[benchmark] Running {task['task_id']}: {task.get('prompt', '')[:60]}..."
         )
         try:
             if task.get("mode") == "multi_turn" or task.get("multi_turn") is True:
                 trace = run_multi_turn_task(
-                    graph,
+                    task_graph,
                     task,
                     db_path=db_path,
                     kb_store=kb_store,
@@ -1200,7 +1275,7 @@ def run_benchmark(
                     simulator_model=simulator_model,
                 )
             else:
-                trace = run_single_task(graph, task)
+                trace = run_single_task(task_graph, task)
         except Exception as exc:
             print(f"[benchmark] TASK ERROR {task['task_id']}: {exc}")
             trace = {
@@ -1210,5 +1285,7 @@ def run_benchmark(
                 "tool_calls": [],
                 "final_response": "",
             }
+        # Record which skill (if any) was used, so results can be analysed later.
+        trace["skill"] = skill["name"] if skill else None
         traces.append(trace)
     return traces
