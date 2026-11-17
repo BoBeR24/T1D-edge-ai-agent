@@ -117,6 +117,23 @@ def generate_markdown_summary(
     lines.append(f"- **Total tool calls**: {total_tool_calls}")
     lines.append(f"- **Total agent turns**: {total_turns}")
 
+    # Token usage summary (traces produced after the token-logging patch)
+    tok_traces = [t for t in traces if t.get("llm_calls")]
+    if tok_traces:
+        n = len(tok_traces)
+        avg_in = sum(t["input_tokens_total"] for t in tok_traces) / n
+        avg_out = sum(t["output_tokens_total"] for t in tok_traces) / n
+        avg_calls = sum(t["llm_calls"] for t in tok_traces) / n
+        avg_first = sum(t["first_call_input_tokens"] for t in tok_traces) / n
+        max_in = max(t["max_input_tokens"] for t in tok_traces)
+        lines.append(f"- **Avg input tokens per task**: {avg_in:.0f}")
+        lines.append(f"- **Avg output tokens per task**: {avg_out:.0f}")
+        lines.append(f"- **Avg LLM calls per task**: {avg_calls:.1f}")
+        lines.append(
+            f"- **Avg first-call input tokens** (prompt + tool schemas + question): {avg_first:.0f}"
+        )
+        lines.append(f"- **Max input tokens in a single call**: {max_in}")
+
     lines.extend(["", "---", "", "## Per-Task Results", ""])
 
     score_by_id = {s["task_id"]: s for s in scores}
@@ -129,6 +146,12 @@ def generate_markdown_summary(
         lines.append(f"**Latency**: {trace.get('latency_ms', 'N/A')} ms")
         lines.append(f"**Tool calls**: {trace.get('tool_call_count', 0)}")
         lines.append(f"**Agent turns**: {trace.get('turn_count', 0)}")
+        if trace.get("llm_calls"):
+            lines.append(
+                f"**Tokens**: in {trace['input_tokens_total']} / "
+                f"out {trace['output_tokens_total']} over {trace['llm_calls']} LLM call(s); "
+                f"first call in {trace['first_call_input_tokens']}"
+            )
 
         if "normalized_score" in score:
             lines.append(f"**Normalized score**: {score['normalized_score']:.3f}")
@@ -215,6 +238,11 @@ def generate_json_summary(
                 "latency_ms": trace.get("latency_ms"),
                 "tool_call_count": trace.get("tool_call_count", 0),
                 "turn_count": trace.get("turn_count", 0),
+                "llm_calls": trace.get("llm_calls"),
+                "input_tokens_total": trace.get("input_tokens_total"),
+                "output_tokens_total": trace.get("output_tokens_total"),
+                "first_call_input_tokens": trace.get("first_call_input_tokens"),
+                "max_input_tokens": trace.get("max_input_tokens"),
                 "normalized_score": score.get("normalized_score"),
                 "scores": score.get("scores", {}),
             }
@@ -233,6 +261,8 @@ def generate_json_summary(
         else None,
         "max_latency_ms": max(latencies) if latencies else None,
         "total_tool_calls": sum(t.get("tool_call_count", 0) for t in traces),
+        "total_input_tokens": sum(t.get("input_tokens_total") or 0 for t in traces),
+        "total_output_tokens": sum(t.get("output_tokens_total") or 0 for t in traces),
         "per_task": per_task,
     }
 

@@ -89,13 +89,16 @@ class InMemoryVectorBackend:
         *,
         limit: int,
         since_cutoff_iso: str | None,
+        until_cutoff_iso: str | None,
         since_field: str,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for vector, payload in self._collections.get(collection, {}).values():
-            if since_cutoff_iso:
-                ts = payload.get(since_field)
-                if isinstance(ts, str) and ts < since_cutoff_iso:
+            ts = payload.get(since_field)
+            if isinstance(ts, str):
+                if since_cutoff_iso and ts < since_cutoff_iso:
+                    continue
+                if until_cutoff_iso and ts > until_cutoff_iso:
                     continue
             row = dict(payload)
             row["score"] = cosine_similarity(vector, query_vector)
@@ -103,12 +106,21 @@ class InMemoryVectorBackend:
         rows.sort(key=lambda r: r.get("score", 0.0), reverse=True)
         return rows[:limit]
 
-    def scroll(self, collection: str, *, since_cutoff_iso: str | None, since_field: str) -> list[dict[str, Any]]:
+    def scroll(
+        self,
+        collection: str,
+        *,
+        since_cutoff_iso: str | None,
+        until_cutoff_iso: str | None,
+        since_field: str,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for _, payload in self._collections.get(collection, {}).values():
-            if since_cutoff_iso:
-                ts = payload.get(since_field)
-                if isinstance(ts, str) and ts < since_cutoff_iso:
+            ts = payload.get(since_field)
+            if isinstance(ts, str):
+                if since_cutoff_iso and ts < since_cutoff_iso:
+                    continue
+                if until_cutoff_iso and ts > until_cutoff_iso:
                     continue
             rows.append(dict(payload))
         rows.sort(key=lambda r: r.get("timestamp", ""))
@@ -164,18 +176,19 @@ class QdrantBackend:
         *,
         limit: int,
         since_cutoff_iso: str | None,
+        until_cutoff_iso: str | None,
         since_field: str,
     ) -> list[dict[str, Any]]:
         query_filter = None
-        if since_cutoff_iso is not None:
+        conditions = []
+        if since_cutoff_iso is not None or until_cutoff_iso is not None:
             qdrant_models = importlib.import_module("qdrant_client.models")
             DatetimeRange = getattr(qdrant_models, "DatetimeRange")
             FieldCondition = getattr(qdrant_models, "FieldCondition")
             Filter = getattr(qdrant_models, "Filter")
 
-            query_filter = Filter(
-                must=[FieldCondition(key=since_field, range=DatetimeRange(gte=since_cutoff_iso))]
-            )
+            conditions.append(FieldCondition(key=since_field, range=DatetimeRange(gte=since_cutoff_iso, lte=until_cutoff_iso)))
+            query_filter = Filter(must=conditions)
 
         response = self._client.query_points(
             collection_name=collection,
@@ -193,17 +206,24 @@ class QdrantBackend:
             rows.append(row)
         return rows
 
-    def scroll(self, collection: str, *, since_cutoff_iso: str | None, since_field: str) -> list[dict[str, Any]]:
+    def scroll(
+        self,
+        collection: str,
+        *,
+        since_cutoff_iso: str | None,
+        until_cutoff_iso: str | None,
+        since_field: str,
+    ) -> list[dict[str, Any]]:
         scroll_filter = None
-        if since_cutoff_iso is not None:
+        conditions = []
+        if since_cutoff_iso is not None or until_cutoff_iso is not None:
             qdrant_models = importlib.import_module("qdrant_client.models")
             DatetimeRange = getattr(qdrant_models, "DatetimeRange")
             FieldCondition = getattr(qdrant_models, "FieldCondition")
             Filter = getattr(qdrant_models, "Filter")
 
-            scroll_filter = Filter(
-                must=[FieldCondition(key=since_field, range=DatetimeRange(gte=since_cutoff_iso))]
-            )
+            conditions.append(FieldCondition(key=since_field, range=DatetimeRange(gte=since_cutoff_iso, lte=until_cutoff_iso)))
+            scroll_filter = Filter(must=conditions)
 
         points, _ = self._client.scroll(
             collection_name=collection,
@@ -229,6 +249,7 @@ class KnowledgeBaseStore:
         "glucose_events": "glucose_events",
         "meal_events": "meal_events",
         "insulin_events": "insulin_events",
+        "calendar_events": "calendar_events",
     }
 
     def __init__(self, path: str = KB_QDRANT_PATH, embedding_model: str = KB_EMBEDDING_MODEL):
@@ -262,16 +283,18 @@ class KnowledgeBaseStore:
         *,
         top_k: int,
         since_days: int | None,
+        until_days: int | None,
         since_field: str,
     ) -> list[dict[str, Any]]:
-        since_cutoff_iso = None
-        if since_days is not None:
-            since_cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+        now = datetime.now(timezone.utc)
+        since_cutoff_iso = (now - timedelta(days=since_days)).isoformat() if since_days is not None else None
+        until_cutoff_iso = (now + timedelta(days=until_days)).isoformat() if until_days is not None else None
         return self._backend.search(
             collection,
             self._embedder.embed(query),
             limit=top_k,
             since_cutoff_iso=since_cutoff_iso,
+            until_cutoff_iso=until_cutoff_iso,
             since_field=since_field,
         )
 
@@ -291,12 +314,13 @@ class KnowledgeBaseStore:
             self._backend.upsert(self.COLLECTIONS["report_chunks"], point_id, self._embedder.embed(chunk), payload)
         return len(chunks)
 
-    def search_reports(self, query: str, *, since_days: int | None = None, top_k: int = 5) -> list[dict[str, Any]]:
+    def search_reports(self, query: str, *, since_days: int | None = None, until_days: int | None = None, top_k: int = 5) -> list[dict[str, Any]]:
         return self._search(
             self.COLLECTIONS["report_chunks"],
             query,
             top_k=top_k,
             since_days=since_days,
+            until_days=until_days,
             since_field="created_at",
         )
 
@@ -315,12 +339,13 @@ class KnowledgeBaseStore:
         self._backend.upsert(self.COLLECTIONS["glucose_events"], point_id, self._embedder.embed(text), payload)
         return point_id
 
-    def search_glucose(self, query: str, *, since_days: int | None = None, top_k: int = 10) -> list[dict[str, Any]]:
+    def search_glucose(self, query: str, *, since_days: int | None = None, until_days: int | None = None, top_k: int = 10) -> list[dict[str, Any]]:
         return self._search(
             self.COLLECTIONS["glucose_events"],
             query,
             top_k=top_k,
             since_days=since_days,
+            until_days=until_days,
             since_field="timestamp",
         )
 
@@ -365,11 +390,62 @@ class KnowledgeBaseStore:
         self._backend.upsert(self.COLLECTIONS["insulin_events"], point_id, self._embedder.embed(text), payload)
         return point_id
 
+    def add_calendar_event(
+        self,
+        *,
+        event_id: str,
+        title: str,
+        event_group: str,
+        start_time: str | datetime,
+        end_time: str | datetime,
+        description: str = "",
+    ) -> str:
+
+        start_iso = coerce_iso(start_time)
+        end_iso = coerce_iso(end_time)
+        point_id = self._point_id(f"calendar:{event_id}:{start_iso}:{title}")
+        payload = {
+            "point_id": point_id,
+            "event_type": "calendar",
+            "event_id": event_id,
+            "title": title,
+            "event_group": event_group,
+            "timestamp": start_iso,
+            "start_time": start_iso,
+            "end_time": end_iso,
+            "description": description,
+            "created_at": utc_now_iso(),
+        }
+        text = (
+            f"calendar event '{title}' from {start_iso} to {end_iso}. "
+            f"Description: {description}."
+        ).strip()
+        self._backend.upsert(
+            self.COLLECTIONS["calendar_events"],
+            point_id,
+            self._embedder.embed(text),
+            payload,
+        )
+        return point_id
+
+    def search_calendar_events(
+        self, query: str, *, since_days: int | None = 0, until_days: int | None = 7, top_k: int = 10
+    ) -> list[dict[str, Any]]:
+        return self._search(
+            self.COLLECTIONS["calendar_events"],
+            query,
+            top_k=top_k,
+            since_days=since_days,
+            until_days=until_days,
+            since_field="timestamp",
+        )
+
     def search_logs(
         self,
         query: str,
         *,
         since_days: int | None = None,
+        until_days: int | None = None,
         event_types: list[str] | None = None,
         top_k: int = 10,
     ) -> list[dict[str, Any]]:
@@ -383,6 +459,7 @@ class KnowledgeBaseStore:
                     query,
                     top_k=top_k,
                     since_days=since_days,
+                    until_days=until_days,
                     since_field="timestamp",
                 )
             )
@@ -393,28 +470,66 @@ class KnowledgeBaseStore:
                     query,
                     top_k=top_k,
                     since_days=since_days,
+                    until_days=until_days,
                     since_field="timestamp",
                 )
             )
         rows.sort(key=lambda r: r.get("score", 0.0), reverse=True)
         return rows[:top_k]
 
-    def get_meal_events(self, *, since_days: int = 14) -> list[dict[str, Any]]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
-        return self._backend.scroll(self.COLLECTIONS["meal_events"], since_cutoff_iso=cutoff, since_field="timestamp")
-
-    def get_insulin_events(self, *, since_days: int = 14) -> list[dict[str, Any]]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+    def get_meal_events(self, *, since_days: int = 14, until_days: int | None = None) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        cutoff_start = (now - timedelta(days=since_days)).isoformat() if since_days is not None else None
+        cutoff_end = (now + timedelta(days=until_days)).isoformat() if until_days is not None else None
         return self._backend.scroll(
-            self.COLLECTIONS["insulin_events"], since_cutoff_iso=cutoff, since_field="timestamp"
+            self.COLLECTIONS["meal_events"],
+            since_cutoff_iso=cutoff_start,
+            until_cutoff_iso=cutoff_end,
+            since_field="timestamp",
         )
+
+    def get_insulin_events(self, *, since_days: int = 14, until_days: int | None = None) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        cutoff_start = (now - timedelta(days=since_days)).isoformat() if since_days is not None else None
+        cutoff_end = (now + timedelta(days=until_days)).isoformat() if until_days is not None else None
+        return self._backend.scroll(
+            self.COLLECTIONS["insulin_events"],
+            since_cutoff_iso=cutoff_start,
+            until_cutoff_iso=cutoff_end,
+            since_field="timestamp",
+        )
+
+    def get_calendar_events(
+            self,
+            *,
+            since_days: int = 0,
+            until_days: int = 1,
+            event_groups: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        cutoff_start = (now - timedelta(days=since_days)).isoformat() if since_days is not None else None
+        cutoff_end = (now + timedelta(days=until_days)).isoformat() if until_days is not None else None
+
+        rows = self._backend.scroll(
+            self.COLLECTIONS["calendar_events"],
+            since_cutoff_iso=cutoff_start,
+            until_cutoff_iso=cutoff_end,
+            since_field="timestamp",
+        )
+
+        if event_groups is not None:
+            rows = [r for r in rows if str(r.get("event_group", "")) in event_groups]
+
+        return rows
+
+    # TODO: Add methods for updating/deleting calendar events
 
     def update_log_event_notes(self, *, event_type: str, point_id: str, notes: str) -> bool:
         if event_type not in {"meal", "insulin"}:
             return False
 
         collection = self.COLLECTIONS["meal_events"] if event_type == "meal" else self.COLLECTIONS["insulin_events"]
-        rows = self._backend.scroll(collection, since_cutoff_iso=None, since_field="timestamp")
+        rows = self._backend.scroll(collection, since_cutoff_iso=None, until_cutoff_iso=None, since_field="timestamp")
         target = next((row for row in rows if str(row.get("point_id", "")) == str(point_id)), None)
         if target is None:
             return False
