@@ -2,8 +2,10 @@
 # LangChain tools for the DiabetesAgent.
 # Add new tools here and append them to TOOLS — no other files need changing.
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from langchain_core.tools import tool
 from pylibrelinkup import PyLibreLinkUp
@@ -934,6 +936,125 @@ def log_insulin(
     )
 
 
+# TODO: For now we consider notifications as just another type of calendar event, this should be changed to a proper notification implementation, or at least a separate database
+@tool
+def add_notification_events_to_kb(notifications: list[dict[str, Any]]) -> str:
+    """Add a list of scheduled notification events to the knowledge base.
+
+    Each notification in the list should be a dictionary containing:
+    - title (str)
+    - start_time (str)
+    - end_time (str, optional, defaults to start_time)
+    - description (str, optional)
+    """
+    if not isinstance(notifications, list):
+        return "Error: 'notifications' must be a list of event dictionaries."
+
+    added_count = 0
+    errors = []
+
+    for item in notifications:
+        try:
+            event_id = str(uuid.uuid4())
+            title = item.get("title", "Untitled Notification")
+            start_time = item.get("start_time")
+            end_time = item.get("end_time", start_time)
+            event_group = "notification"
+            description = item.get("description", "")
+
+            if not start_time or not end_time:
+                errors.append(f"Missing start_time or end_time for notification '{title}'")
+                continue
+
+            kb_store.add_calendar_event(
+                event_id=event_id,
+                title=title,
+                start_time=start_time,
+                end_time=end_time,
+                event_group=event_group,
+                description=description,
+            )
+            added_count += 1
+        except Exception as exc:
+            errors.append(f"Failed to add '{item.get('title', 'Unknown')}': {exc}")
+
+    result = f"Successfully added {added_count} notification event(s) to the knowledge base."
+    if errors:
+        result += f" Errors encountered ({len(errors)}): " + "; ".join(errors)
+    return result
+
+
+@tool
+def add_calendar_event_to_kb(
+        title: str,
+        start_time: str,
+        end_time: str,
+        event_group: str = "general",
+        description: str = "",
+) -> str:
+    """Add a calendar event to the knowledge base.
+
+    event_group should indicate the type of planned event.
+    Allowed event_groups values:
+    'planned_activity', 'planned_meal', 'notification'
+    """
+    try:
+        point_id = kb_store.add_calendar_event(
+            event_id=str(uuid.uuid4()),
+            title=title,
+            start_time=start_time,
+            end_time=end_time,
+            event_group=event_group,
+            description=description,
+        )
+        return f"Successfully stored calendar event '{title}' (group: {event_group}) with ID {point_id}."
+    except Exception as exc:
+        return f"Failed to store calendar event: {exc}"
+
+
+@tool
+def get_calendar_events_from_kb(
+        since_days: int = 0,
+        until_days: int = 1,
+        event_groups: list[str] | None = None,
+) -> str:
+    """Retrieve calendar events from the knowledge base within a time range. Time range is defined starting from the current time,
+    since_days is time delta into the past, until_days is time delta into the future.
+
+    Example:
+    - since_days == 0 -- from current time, since_days == 1 -- from the day before.
+    - until_days == 0 -- until current time, until_days == 1 -- until the day after.
+
+    Parameters:
+    - since_days (int, defaults to 0)
+    - until_days (int, defaults to 1)
+    - event_groups (list[str], optional, defaults to None) must be a list of groups to filter by. Leave as default to retrieve all events
+    Allowed event_groups values:
+        'planned_activity', 'planned_meal', 'notification'
+    """
+    # if event_groups is None:
+    #     event_groups = []
+    # groups_filter = [g.strip() for g in event_groups.split(",") if g.strip()] if event_groups else None
+
+    try:
+        events = kb_store.get_calendar_events(
+            since_days=since_days,
+            until_days=until_days,
+            event_groups=event_groups,
+        )
+        if not events:
+            return f"No calendar events found in the specified range (past {since_days} to future {until_days} days)."
+
+        lines = [
+            f"- [{e.get('event_group', 'unknown')}] {e.get('title', 'Untitled')} @ {e.get('start_time', '?')} to {e.get('end_time', '?')}"
+            f" (Location: {e.get('location', 'N/A')})"
+            for e in events
+        ]
+        return f"Found {len(events)} calendar events:\n" + "\n".join(lines)
+    except Exception as exc:
+        return f"Failed to retrieve calendar events: {exc}"
+
+
 @tool
 def search_logged_events(
     query: str, since_days: int = 30, event_types: str = "meal,insulin"
@@ -1191,8 +1312,7 @@ def calculate_insulin_dosage(
         f"{units} units of rapid insulin.\n{MEDICAL_DISCLAIMER}"
     )
 
-
-TOOLS = [
+CORE_TOOLS = [
     get_latest_glucose,
     get_glucose_logbook,
     get_glucose_history,
@@ -1214,6 +1334,8 @@ TOOLS = [
     log_glucose,
     log_meal,
     log_insulin,
+    add_calendar_event_to_kb,
+    get_calendar_events_from_kb,
     search_logged_events,
     get_icr_summary,
     set_insulin_ratio,
@@ -1223,3 +1345,10 @@ TOOLS = [
     *SPOONACULAR_TOOLS,
     *TAVILY_TOOLS,
 ]
+
+ALL_TOOLS = [
+    *CORE_TOOLS,
+    add_notification_events_to_kb
+]
+
+# TODO: add more verbose tool descriptions
