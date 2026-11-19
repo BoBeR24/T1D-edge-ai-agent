@@ -5,7 +5,77 @@
 from __future__ import annotations
 
 from datetime import datetime
-from agent.data.cgm_store import parse_iso
+from typing import Any
+
+from agent.data.cgm_store import MG_DL_TO_MMOL_L, parse_iso
+
+# International consensus on time in ranges (Battelino et al., Diabetes Care 2019).
+# Thresholds are in mg/dL, the unit the consensus defines them in, so that a
+# reading of exactly 70 or 180 mg/dL lands in range instead of being pushed out
+# by mmol/L rounding (70 / 18 = 3.889 < 3.9).
+TBR2_MG_DL = 54.0  # level 2 hypoglycaemia: < 54 mg/dL (< 3.0 mmol/L)
+TBR1_MG_DL = 70.0  # below range: < 70 mg/dL (< 3.9 mmol/L)
+TAR1_MG_DL = 180.0  # above range: > 180 mg/dL (> 10.0 mmol/L)
+TAR2_MG_DL = 250.0  # level 2 hyperglycaemia: > 250 mg/dL (> 13.9 mmol/L)
+CV_TARGET_PERCENT = 36.0
+MIN_DAYS_OF_DATA = 14
+MIN_SENSOR_COVERAGE_PERCENT = 70.0
+
+
+def _typical_interval_minutes(timestamps: list[datetime]) -> float | None:
+    """Median gap between consecutive readings, i.e. the sensor's sampling rate."""
+    gaps = sorted(
+        (b - a).total_seconds() / 60.0
+        for a, b in zip(timestamps, timestamps[1:])
+        if b > a
+    )
+    if not gaps:
+        return None
+    return gaps[len(gaps) // 2]
+
+
+def compute_clinical_cgm_metrics(
+    series: list[tuple[str, float]], period_days: int
+) -> dict[str, Any] | None:
+    """Consensus CGM metrics from (timestamp, glucose_mmol_l) pairs.
+
+    Percentages are shares of readings, which equal shares of time when the
+    sensor samples at a fixed rate.
+    """
+    if not series:
+        return None
+
+    timestamps = [parse_iso(ts) for ts, _ in series]
+    mg_dl = [round(v * MG_DL_TO_MMOL_L, 1) for _, v in series]
+    n = len(mg_dl)
+
+    def pct(count: int) -> float:
+        return 100.0 * count / n
+
+    mean_mg_dl = sum(mg_dl) / n
+    sd_mg_dl = (sum((v - mean_mg_dl) ** 2 for v in mg_dl) / n) ** 0.5
+
+    interval = _typical_interval_minutes(timestamps)
+    if interval:
+        coverage = min(100.0, 100.0 * n * interval / (period_days * 24 * 60))
+    else:
+        coverage = None
+
+    return {
+        "count": n,
+        "mean_mmol_l": mean_mg_dl / MG_DL_TO_MMOL_L,
+        # Glucose management indicator (Bergenstal et al., Diabetes Care 2018).
+        "gmi_percent": 3.31 + 0.02392 * mean_mg_dl,
+        "cv_percent": 100.0 * sd_mg_dl / mean_mg_dl if mean_mg_dl else 0.0,
+        "tbr_level2": pct(sum(1 for v in mg_dl if v < TBR2_MG_DL)),
+        "tbr_level1": pct(sum(1 for v in mg_dl if TBR2_MG_DL <= v < TBR1_MG_DL)),
+        "tir": pct(sum(1 for v in mg_dl if TBR1_MG_DL <= v <= TAR1_MG_DL)),
+        "tar_level1": pct(sum(1 for v in mg_dl if TAR1_MG_DL < v <= TAR2_MG_DL)),
+        "tar_level2": pct(sum(1 for v in mg_dl if v > TAR2_MG_DL)),
+        "interval_minutes": interval,
+        "coverage_percent": coverage,
+    }
+
 
 # (start_timestamp, end_timestamp, start_value, end_value, delta)
 Excursion = tuple[str, str, float, float, float]

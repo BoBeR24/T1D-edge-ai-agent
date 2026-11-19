@@ -10,7 +10,14 @@ from typing import Any
 from langchain_core.tools import tool
 from pylibrelinkup import PyLibreLinkUp
 
-from agent.data.cgm_analytics import detect_glucose_excursions, format_excursions
+from agent.data.cgm_analytics import (
+    CV_TARGET_PERCENT,
+    MIN_DAYS_OF_DATA,
+    MIN_SENSOR_COVERAGE_PERCENT,
+    compute_clinical_cgm_metrics,
+    detect_glucose_excursions,
+    format_excursions,
+)
 from agent.data.cgm_store import cgm_store, reading_to_json
 from agent.kb.store import coerce_iso, kb_store, parse_iso
 from agent.spoonacular import SPOONACULAR_TOOLS
@@ -547,6 +554,69 @@ def get_cgm_summary_from_db(days: int = 7, low: float = 3.9, high: float = 10.0)
         f"time in range {low}–{high} mmol/L: {summary['tir']:.1f}%, "
         f"estimated A1C: {summary['estimated_a1c']:.2f}%."
     )
+
+
+@tool
+def get_cgm_clinical_metrics(days: int = 14) -> str:
+    """Standard CGM report for the past N days, following the international
+    consensus on time in ranges: time below range (level 1 and 2), time in range,
+    time above range (level 1 and 2), glucose variability (CV), mean glucose and
+    GMI, each with its clinical target, plus a warning when there is too little
+    data to trust the numbers. Use this for overall glucose control, hypoglycaemia
+    risk and variability questions. 14 days is the recommended period."""
+    if days <= 0:
+        return "`days` must be greater than 0."
+
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    series = cgm_store.get_glucose_series(
+        start_iso=start_dt.isoformat(), end_iso=end_dt.isoformat()
+    )
+    m = compute_clinical_cgm_metrics(series, period_days=days)
+    if m is None:
+        return f"No CGM readings found in SQLite for the past {days} days."
+
+    def check(ok: bool) -> str:
+        return "meets target" if ok else "ABOVE target"
+
+    below = m["tbr_level1"] + m["tbr_level2"]
+    above = m["tar_level1"] + m["tar_level2"]
+    lines = [
+        f"CGM clinical metrics (past {days} days, {m['count']} readings):",
+        f"- Time below 3.0 mmol/L: {m['tbr_level2']:.1f}% "
+        f"(target <1%, {check(m['tbr_level2'] < 1)})",
+        f"- Time below 3.9 mmol/L (incl. <3.0): {below:.1f}% "
+        f"(target <4%, {check(below < 4)})",
+        f"- Time in range 3.9–10.0 mmol/L: {m['tir']:.1f}% "
+        f"(target >70%, {'meets target' if m['tir'] > 70 else 'BELOW target'})",
+        f"- Time above 10.0 mmol/L (incl. >13.9): {above:.1f}% "
+        f"(target <25%, {check(above < 25)})",
+        f"- Time above 13.9 mmol/L: {m['tar_level2']:.1f}% "
+        f"(target <5%, {check(m['tar_level2'] < 5)})",
+        f"- Glucose variability (CV): {m['cv_percent']:.1f}% "
+        f"(target ≤{CV_TARGET_PERCENT:.0f}%, "
+        f"{check(m['cv_percent'] <= CV_TARGET_PERCENT)})",
+        f"- Mean glucose: {m['mean_mmol_l']:.1f} mmol/L; GMI: {m['gmi_percent']:.1f}%",
+    ]
+
+    warnings = []
+    if days < MIN_DAYS_OF_DATA:
+        warnings.append(
+            f"the period is shorter than the recommended {MIN_DAYS_OF_DATA} days"
+        )
+    if m["coverage_percent"] is not None:
+        lines.append(f"- Sensor data coverage: {m['coverage_percent']:.0f}%")
+        if m["coverage_percent"] < MIN_SENSOR_COVERAGE_PERCENT:
+            warnings.append(
+                f"sensor data covers less than {MIN_SENSOR_COVERAGE_PERCENT:.0f}% "
+                "of the period"
+            )
+    if warnings:
+        lines.append(
+            "Data warning: " + "; ".join(warnings) + ", so these numbers may not "
+            "represent usual glucose control."
+        )
+    return "\n".join(lines)
 
 
 @tool
@@ -1264,6 +1334,7 @@ CORE_TOOLS = [
     get_cgm_readings,
     get_recent_cgm_readings,
     get_cgm_summary_from_db,
+    get_cgm_clinical_metrics,
     get_cgm_spikes_from_db,
     get_nearest_cgm_reading,
     run_deferred_log_enrichment,

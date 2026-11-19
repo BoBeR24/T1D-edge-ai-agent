@@ -185,6 +185,8 @@ The agent has roughly 30 tools spanning:
 
 - **Live CGM** — latest reading, logbook, history (needs LibreLinkUp credentials)
 - **Stored CGM** — range queries, summaries, spike detection, nearest-reading lookup
+- **Clinical metrics** — consensus time below / in / above range, variability (CV), GMI,
+  each with its target, and a warning when there is too little data
 - **Glucose statistics** — time in range, average glucose, estimated A1C
 - **Logging** — meals, insulin, glucose, with automatic CGM context attached
 - **Knowledge base** — semantic search over logged events, past reports, and patterns
