@@ -13,6 +13,7 @@ from langchain_core.tools import tool
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
+from agent.data.cgm_analytics import detect_glucose_excursions, format_excursions
 from agent.llm import get_llm
 from agent.tools import (
     get_cgm_readings,
@@ -364,7 +365,10 @@ def _build_benchmark_tools(db_path: str, no_tools: bool = False) -> list[Any]:
         min_drop_mmol_l: float = 2.2,
         window_minutes: int = 120,
     ) -> str:
-        """Detect notable glucose spikes and dips from SQLite for an explicit UTC range."""
+        """Detect notable glucose spikes and dips from SQLite for an explicit UTC range.
+
+        A spike is a rise of at least min_rise_mmol_l reached within window_minutes
+        (a dip is the same for a drop). Each rise or fall is counted once."""
         try:
             start = _coerce_iso(start_iso)
             end = _coerce_iso(end_iso)
@@ -386,68 +390,32 @@ def _build_benchmark_tools(db_path: str, no_tools: bool = False) -> list[Any]:
                 f"Not enough CGM readings from {start} to {end} to detect excursions."
             )
 
-        spikes: list[tuple[str, str, float, float, float]] = []
-        dips: list[tuple[str, str, float, float, float]] = []
+        if min_rise_mmol_l <= 0 or min_drop_mmol_l <= 0 or window_minutes <= 0:
+            return (
+                "`min_rise_mmol_l`, `min_drop_mmol_l` and `window_minutes` must be "
+                "greater than 0."
+            )
 
-        for i, start_row in enumerate(rows):
-            start_ts = str(start_row["factory_timestamp_utc"])
-            start_val = float(start_row["glucose_mmol_l"])
-            found_spike = False
-            found_dip = False
-
-            for end_row in rows[i + 1 :]:
-                end_ts = str(end_row["factory_timestamp_utc"])
-                end_val = float(end_row["glucose_mmol_l"])
-                delta = end_val - start_val
-
-                if (not found_spike) and delta >= min_rise_mmol_l:
-                    spikes.append((start_ts, end_ts, start_val, end_val, delta))
-                    found_spike = True
-
-                if (not found_dip) and delta <= -min_drop_mmol_l:
-                    dips.append((start_ts, end_ts, start_val, end_val, delta))
-                    found_dip = True
-
-                if found_spike and found_dip:
-                    break
-
+        spikes, dips = detect_glucose_excursions(
+            [(str(r["factory_timestamp_utc"]), float(r["glucose_mmol_l"])) for r in rows],
+            min_rise_mmol_l=min_rise_mmol_l,
+            min_drop_mmol_l=min_drop_mmol_l,
+            window_minutes=window_minutes,
+        )
         if not spikes and not dips:
             return (
                 f"No spikes/dips found from {start} to {end} "
-                f"with rise >= {min_rise_mmol_l:.1f} mmol/L or drop >= {min_drop_mmol_l:.1f} mmol/L."
+                f"with rise >= {min_rise_mmol_l:.1f} mmol/L or drop >= {min_drop_mmol_l:.1f} mmol/L "
+                f"in <= {window_minutes} minutes."
             )
 
-        spike_lines = [
-            f"{s[0]} -> {s[1]}: {s[2]:.1f} → {s[3]:.1f} mmol/L (rise {s[4]:+.1f})"
-            for s in spikes[:10]
-        ]
-        dip_lines = [
-            f"{d[0]} -> {d[1]}: {d[2]:.1f} → {d[3]:.1f} mmol/L (drop {d[4]:+.1f})"
-            for d in dips[:10]
-        ]
-
-        blocks = [
-            (
-                f"Spikes: {len(spikes)} detected "
-                f"(threshold +{min_rise_mmol_l:.1f} mmol/L)."
-                + (
-                    "\n" + "\n".join(f"- {line}" for line in spike_lines)
-                    if spike_lines
-                    else ""
-                )
-            ),
-            (
-                f"Dips: {len(dips)} detected "
-                f"(threshold -{min_drop_mmol_l:.1f} mmol/L)."
-                + (
-                    "\n" + "\n".join(f"- {line}" for line in dip_lines)
-                    if dip_lines
-                    else ""
-                )
-            ),
-        ]
-
-        return f"SQLite CGM excursions ({start} to {end}):\n" + "\n\n".join(blocks)
+        return f"SQLite CGM excursions ({start} to {end}):\n" + format_excursions(
+            spikes,
+            dips,
+            min_rise_mmol_l=min_rise_mmol_l,
+            min_drop_mmol_l=min_drop_mmol_l,
+            window_minutes=window_minutes,
+        )
 
     def _range_values(start_iso: str, end_iso: str):
         """Fetch (timestamp, glucose_mmol_l) tuples for an inclusive UTC range.

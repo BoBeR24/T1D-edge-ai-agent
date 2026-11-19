@@ -395,6 +395,35 @@ class CGMStore:
 
         return [dict(row) for row in rows]
 
+    def get_glucose_series(
+        self, *, start_iso: str, end_iso: str, patient_id: str | None = None
+    ) -> list[tuple[str, float]]:
+        """All (timestamp, glucose_mmol_l) pairs in a range, oldest first.
+
+        Unlike get_readings there is no row cap, so aggregate metrics cover the
+        whole period even for sensors that report every minute.
+        """
+        start = coerce_iso(start_iso)
+        end = coerce_iso(end_iso)
+        args: list[Any] = [start, end]
+        where = "factory_timestamp_utc >= ? AND factory_timestamp_utc <= ?"
+        if patient_id:
+            where += " AND patient_id = ?"
+            args.append(str(patient_id))
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT factory_timestamp_utc, glucose_mmol_l
+                FROM cgm_readings
+                WHERE {where}
+                ORDER BY factory_timestamp_utc ASC
+                """,
+                args,
+            ).fetchall()
+
+        return [(str(r[0]), float(r[1])) for r in rows]
+
     def get_nearest_reading(
         self,
         *,
